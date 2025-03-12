@@ -1,14 +1,14 @@
-
 import os
 import datetime
 import argparse
-
+import sys
 import numpy as np
 import torch
 import torch.distributed as dist
 from torch.multiprocessing import Process
 import torchvision.utils as tvu
-
+from cleverhans.torch.attacks.fast_gradient_method import fast_gradient_method  
+from cleverhans.torch.attacks.carlini_wagner_l2 import carlini_wagner_l2
 from attacks.pgd_eot import PGD
 from attacks.pgd_eot_l2 import PGDL2
 from attacks.pgd_eot_bpda import BPDA
@@ -26,7 +26,6 @@ import shutil
 def save_img(idx,img,pred,y,name):
     
     begin = idx * args.batch_size
-    # print(begin)
     for i in range(img.shape[0]):
         if pred.reshape(-1)[i] == y[i]:
             path = './pure_images/{}/correct'.format(name)
@@ -41,7 +40,6 @@ def save_img(idx,img,pred,y,name):
 def save(idx,img,name):
     
     begin = idx * args.batch_size
-    # print(begin)
     path = './{}'.format(name)
     if not os.path.exists(path):
         os.makedirs(path)
@@ -72,20 +70,14 @@ def predict(x, args, defense_forward, num_classes):
         pred = logits.max(1, keepdim=True)[1]
         for idx in range(x.shape[0]):
             ensemble[idx, pred[idx]] += 1
-
-        # logits = torch.softmax(logits,dim=1)
-        # print(torch.topk(logits,dim=1,k=5))
     pred = ensemble.max(1, keepdim=True)[1]
     
     return pure_images,pred
 
 
-def test(rank, gpu, args):
+def test(rank, world_size, args):
 
-
-    if os.path.exists('./pure_images'):
-        shutil.rmtree('./pure_images')
-    print('rank {} | gpu {} started'.format(rank, gpu))
+    print('rank {} | world_size {} started'.format(rank, world_size))
 
     model_src = diffusion_model_path[args.dataset]
     is_imagenet = True if args.dataset == 'imagenet' else False
@@ -93,21 +85,20 @@ def test(rank, gpu, args):
     num_classes = 1000 if is_imagenet else 10
 
     # Device
-    device = torch.device('cuda:{}'.format(gpu))
+    device = torch.device('cuda:{}'.format(rank))
 
     # Load dataset
     assert 512 % args.batch_size == 0
     testset = load_dataset_by_name(args.dataset, dataset_root, 512)
     testsampler = torch.utils.data.distributed.DistributedSampler(testset,
-                                                                  num_replicas=args.world_size,
-                                                                  rank=rank)
+                                                                num_replicas=world_size,
+                                                                rank=rank)
     testLoader = torch.utils.data.DataLoader(testset,
-                                             batch_size=args.batch_size,
-                                             num_workers=0,
-                                             pin_memory=True,
-                                             sampler=testsampler,
-                                             drop_last=False)
-    dist.barrier()
+                                            batch_size=args.batch_size,
+                                            num_workers=0,
+                                            pin_memory=True,
+                                            sampler=testsampler,
+                                            drop_last=False)
 
 
     correct_nat = torch.tensor([0]).to(device)
@@ -115,15 +106,16 @@ def test(rank, gpu, args):
     total = torch.tensor([0]).to(device)
 
     for idx, (x, y) in enumerate(testLoader):
+        
         # Load models
         clf, diffusion = load_models(args, model_src, device)
 
         # Set diffusion process for attack and defense
         attack_forward = PurificationForward(
-            clf=clf, diffusion=diffusion,strength_a=args.strength_a,strength_b=args.strength_b,  
+            clf=clf, diffusion=diffusion,strength_a=args.strength_l,strength_b=args.strength_s, classifier_name=args.classifier_name ,
             is_imagenet=is_imagenet,threshold=args.threshold,threshold_percent=args.threshold_percent,ddim_steps=args.attack_ddim_steps,forward_noise_steps = args.forward_noise_steps,device=device)
         defense_forward = PurificationForward(
-            clf=clf, diffusion=diffusion,strength_a=args.strength_a,strength_b=args.strength_b,  
+            clf=clf, diffusion=diffusion,strength_a=args.strength_s,strength_b=args.strength_s,  classifier_name=args.classifier_name ,
             is_imagenet=is_imagenet,threshold=args.threshold,threshold_percent=args.threshold_percent,ddim_steps=args.defense_ddim_steps,forward_noise_steps = args.forward_noise_steps, device=device)
 
         # Set adversarial attack
@@ -161,17 +153,11 @@ def test(rank, gpu, args):
                     args.n_iter, eps, args.eot))
         elif args.dataset == 'imagenet':
             print('[Dataset] ImageNet')
-            if args.attack_method == 'aa':
-                eps = 4./255.
-                attack = AutoAttackLinf(attack_forward, attack_steps=args.n_iter,
+            if args.attack_method == 'pgd':  # PGD Linf
+                eps = 8./255.
+                attack = PGD(attack_forward, attack_steps=args.n_iter,
                             eps=eps, step_size=0.007, eot=args.eot)
-                print('[Attack] ImageNet | AutoAttack Linf | attack_steps: {} | eps: {} | eot: {}'.format(
-                    args.n_iter, eps, args.eot))
-            if args.attack_method == 'aa_l2':
-                eps = 4./255.
-                attack = AutoAttackL2(attack_forward, attack_steps=args.n_iter,
-                            eps=eps, step_size=0.007, eot=args.eot)
-                print('[Attack] ImageNet | AutoAttack L2 | attack_steps: {} | eps: {} | eot: {}'.format(
+                print('[Attack] PGD Linf | attack_steps: {} | eps: {:.3f} | eot: {}'.format(
                     args.n_iter, eps, args.eot))
         elif args.dataset == 'svhn':
             print('[Dataset] SVHN')
@@ -186,8 +172,12 @@ def test(rank, gpu, args):
         x = x.to(device)
         y = y.to(device)
 
-        x_adv = attack(x, y)
-
+        if args.attack_method == 'cw':
+            x_adv = carlini_wagner_l2(attack_forward,x,10)
+        elif args.attack_method == 'fgm':
+            x_adv = fast_gradient_method(attack_forward,x, 0.1, np.inf)
+        else:
+            x_adv = attack(x, y)
 
 
 
@@ -199,7 +189,6 @@ def test(rank, gpu, args):
             correct_nat += pred_nat.eq(y.view_as(pred_nat)).sum().item()
 
             save_img(idx,pure_nat,pred_nat,y,'nat')
-            print('-'*30)
 
             pure_adv,pred_adv = predict(x_adv, args, defense_forward, num_classes)
             correct_adv += pred_adv.eq(y.view_as(pred_adv)).sum().item()
@@ -220,34 +209,30 @@ def test(rank, gpu, args):
     dist.all_reduce(correct_adv, op=dist.ReduceOp.SUM)
     print('rank {} | num_samples: {} | acc_nat: {:.3f}% | acc_adv: {:.3f}%'.format(
         rank, total.item(), (correct_nat / total *
-                             100).item(), (correct_adv / total * 100).item()
+                            100).item(), (correct_adv / total * 100).item()
     ))
+
+
 
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=globals()['__doc__'])
     parser.add_argument('--seed', type=int, default=2024, help='Random seed')
-    parser.add_argument("--use_cuda", default='True',
-                        help="Whether use gpu or not")
-    parser.add_argument("--use_wandb", action='store_true',
-                        help="Whether use wandb or not")
-    parser.add_argument("--wandb_project_name",
-                        default='test', help="Wandb project name")
-    parser.add_argument('--exp', type=str, default='test', help='Experiment name')
     parser.add_argument("--dataset", type=str, default='cifar10',
                         choices=['cifar10', 'imagenet', 'svhn'])
-    parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--strength_a', type=float, default=0.2,help='hyperparameters t_a in the paper')
-    parser.add_argument('--strength_b', type=float, default=0.1,help='hyperparameters t_b in the paper')
-    parser.add_argument('--threshold', type=float, default=0.85,help='default,value-based,hyperparameters tau in the paper')
-    parser.add_argument('--threshold_percent', type=float, default=0.15,help='percent-based')
-    parser.add_argument('--attack_ddim_steps', type=int, default=10,help='surrogate process')
-    parser.add_argument('--defense_ddim_steps', type=int, default=200)
-    parser.add_argument('--forward_noise_steps', type=int, default=10)
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--strength_l', type=float, default=0.2)
+    parser.add_argument('--strength_s', type=float, default=0.1)
+    parser.add_argument('--threshold', type=float, default=0.9,help='Divide the attention mask according to the given threshold. For CIFAR10, We use this method')
+    parser.add_argument('--threshold_percent', type=float, default=0.15,help='Divide the attention mask according to the given ratio. For ImageNet, We use thid method')
+    parser.add_argument('--classifier_name', type=str,default='WideResNet28-10',choices=['ResNet50','WideResNet28-10','WideResNet70-16'])
+    parser.add_argument('--attack_ddim_steps', type=int, default=10)
+    parser.add_argument('--defense_ddim_steps', type=int, default=500)
+    parser.add_argument('--forward_noise_steps', type=int, default=3)
     # Attack
     parser.add_argument("--attack_method", type=str, default='pgd',
-                        choices=['pgd', 'pgd_l2', 'bpda','aa','aa_l2'])
+                        choices=['pgd', 'pgd_l2', 'bpda','aa','aa_l2','cw','fgm'])
     parser.add_argument('--n_iter', type=int, default=200,
                         help='The nubmer of iterations for the attack generation')
     parser.add_argument('--eot', type=int, default=20,
@@ -257,22 +242,6 @@ def parse_args():
     parser.add_argument('--num_ensemble_runs', type=int, default=20,
                         help='The number of ensemble runs for purification in defense')
 
-
-
-
-    # Torch DDP
-    parser.add_argument('--num_proc_node', type=int, default=1,
-                        help='The number of nodes in multi node env.')
-    parser.add_argument('--num_process_per_node', type=int, default=1,
-                        help='Number of gpus')
-    parser.add_argument('--node_rank', type=int, default=0,
-                        help='The index of node.')
-    parser.add_argument('--local_rank', type=int, default=0,
-                        help='Rank of process in the node')
-    parser.add_argument('--master_address', type=str, default='localhost',
-                        help='Address for master')
-    parser.add_argument('--port', type=str, default='1234',
-                        help='Port number for torch ddp')
 
     args = parser.parse_args()
 
@@ -286,42 +255,38 @@ def parse_args():
     return args
 
 
-def cleanup():
-    dist.destroy_process_group()
 
 
-def init_processes(rank, size, fn, args):
-    os.environ['MASTER_ADDR'] = args.master_address
-    os.environ['MASTER_PORT'] = args.port
-    torch.cuda.set_device(args.local_rank)
-    gpu = args.local_rank
-    dist.init_process_group(backend='nccl', init_method='env://', rank=rank, world_size=size,
-                            timeout=datetime.timedelta(hours=4))
-    fn(rank, gpu, args)
-    dist.barrier()
-    cleanup()
+def init_processes(fn, args):
+    rank = int(os.environ['RANK'])
+    local_rank = int(os.environ['LOCAL_RANK'])
+    world_size = int(os.environ["WORLD_SIZE"])
+    dist.init_process_group(backend='nccl')
+    fn(rank, world_size, args)
+
+
+
+
+
+class Tee:
+    def __init__(self, *file_names):
+        self.file_objects = [sys.stdout]  #
+        self.file_objects.extend([open(file_name, 'a') for file_name in file_names])  #
+
+    def write(self, message):
+        for file_object in self.file_objects:
+            file_object.write(message)
+            file_object.flush()  
+
+    def flush(self):
+        for file_object in self.file_objects:
+            file_object.flush()
+
 
 
 if __name__ == '__main__':
-    torch.multiprocessing.set_start_method('spawn')
+    log_file = './output_logs.txt'
+    sys.stdout = Tee(log_file)  
     args = parse_args()
-    args.world_size = args.num_proc_node * args.num_process_per_node
-    size = args.num_process_per_node
-    print(args)
-
-    if size > 1:
-        processes = []
-        for rank in range(size):
-            args.local_rank = rank
-            global_rank = rank + args.node_rank * args.num_process_per_node
-            global_size = args.num_proc_node * args.num_process_per_node
-            args.global_rank = global_rank
-            p = Process(target=init_processes, args=(
-                global_rank, global_size, test, args))
-            p.start()
-            processes.append(p)
-
-        for p in processes:
-            p.join()
-    else:
-        init_processes(0, size, test, args)
+    print(args)  
+    init_processes(test, args)

@@ -1,0 +1,2 @@
+#!/bin/bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 ddp_test.py --dataset imagenet --batch_size 1 --strength_l 0.4 --strength_s 0.2 --threshold_percent 0.15 --classifier_name ResNet50 --attack_ddim_steps 10 --defense_ddim_steps 500 --forward_noise_steps 3 --attack_method pgd  --n_iter 20 --eot 20 --num_ensemble_runs 20

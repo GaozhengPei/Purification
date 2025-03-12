@@ -37,7 +37,7 @@ def save_image(x):
     """
     x = (x + 1)/2
     x = (x[0].permute(1,2,0).detach().cpu().numpy() * 255).astype(np.uint8)
-
+    # Image.fromarray(x).save('./image_noise.png')
 
 def get_ddim_steps(total_time_steps,sample_steps,strength):
     step = total_time_steps//sample_steps
@@ -49,10 +49,12 @@ def get_ddim_steps(total_time_steps,sample_steps,strength):
 
 def threshold_percent_area(pure_area, threshold_percent):
     B, H, W = pure_area.shape
-    flattened_pure_area = pure_area.view(B, -1)  
+    flattened_pure_area = pure_area.view(B, -1)  # [B, H*W]
     result = torch.zeros_like(flattened_pure_area)
-    k = int(H * W * threshold_percent) 
+    k = int(H * W * threshold_percent)  
+    # print(k)
     for i in range(B):
+        # top k index
         topk_values, topk_indices = torch.topk(flattened_pure_area[i], k)
         result[i][topk_indices] = 1
     result = result.reshape(B, H, W)
@@ -60,7 +62,7 @@ def threshold_percent_area(pure_area, threshold_percent):
 
 
 class PurificationForward(torch.nn.Module):
-    def __init__(self, clf, diffusion,strength_a,strength_b, is_imagenet,forward_noise_steps,threshold,threshold_percent,ddim_steps,device):
+    def __init__(self, clf, diffusion,strength_a,strength_b,classifier_name, is_imagenet,forward_noise_steps,threshold,threshold_percent,ddim_steps,device):
         super().__init__()
         self.clf = clf
         self.diffusion = diffusion
@@ -69,7 +71,7 @@ class PurificationForward(torch.nn.Module):
         self.strength_a = strength_a
         self.strength_b = strength_b
         self.forward_noise_steps = forward_noise_steps
-
+        self.classifier_name = classifier_name
         self.num_train_timesteps = 1000
 
         self.sample_steps = ddim_steps
@@ -94,7 +96,8 @@ class PurificationForward(torch.nn.Module):
         self.threshold_percent = threshold_percent
 
     def compute_attention_map(self,activation):
-        G_2sum = torch.sum(torch.abs(activation)**2, dim=1) 
+        # Shape of activation : (B, C, H, W)
+        G_2sum = torch.sum(torch.abs(activation)**2, dim=1)  # Shape: (B, H, W)
         return G_2sum
 
     def get_activation(self,name):
@@ -113,32 +116,55 @@ class PurificationForward(torch.nn.Module):
     def get_mask(self,x):
         batch_size,c,h,w = x.shape
 
-        self.clf.block1.layer[-1].relu2.register_forward_hook(self.get_activation('block1'))
-        self.clf.block2.layer[-1].relu2.register_forward_hook(self.get_activation('block2'))
-        self.clf.block3.layer[-1].relu2.register_forward_hook(self.get_activation('block3'))
-        self.clf.relu.register_forward_hook(self.get_activation('block4'))
+        ## Extract attention activation map
+        if self.classifier_name == 'ResNet50':
+            #### resnet50
+            self.clf.layer1[-1].register_forward_hook(self.get_activation('block1'))
+            self.clf.layer2[-1].register_forward_hook(self.get_activation('block2'))
+            self.clf.layer3[-1].register_forward_hook(self.get_activation('block3'))
+            self.clf.layer4[-1].register_forward_hook(self.get_activation('block4'))
+        if self.classifier_name == 'WideResNet28-10':
+            self.clf.block1.layer[-1].relu2.register_forward_hook(self.get_activation('block1'))
+            self.clf.block2.layer[-1].relu2.register_forward_hook(self.get_activation('block2'))
+            self.clf.block3.layer[-1].relu2.register_forward_hook(self.get_activation('block3'))
+            self.clf.relu.register_forward_hook(self.get_activation('block4'))
+        if self.classifier_name == 'WideResNet70-16':
+            ## wideresnet
+            self.clf.layer[0].block[-1].relu_1.register_forward_hook(self.get_activation('block1'))
+            self.clf.layer[1].block[-1].relu_1.register_forward_hook(self.get_activation('block2'))
+            self.clf.layer[2].block[-1].relu_1.register_forward_hook(self.get_activation('block3'))
+            self.clf.relu.register_forward_hook(self.get_activation('block4'))
+        if self.classifier_name == 'Others':
+            ### You can define activation map according to your classifier here.
+            pass
+
+
+
 
 
         _ = self.clf(data_normalize(x))
+
         pure_area = torch.zeros(size=(batch_size,h,w))
         for i, block in enumerate(['block1', 'block2', 'block3','block4']):
             attention_map = self.compute_attention_map(self.activations[block]).cpu()
-            attention_map = attention_map.unsqueeze(1) 
+            attention_map = attention_map.unsqueeze(1)  #  (B, 1, H, W)
             attention_map = F.interpolate(attention_map, size=(h, w), mode='bilinear', align_corners=False)
-
+            #(B,1,H,W)--->(B,H,W)
             attention_map = attention_map.squeeze(1)
 
+            # To [0, 1]
             attention_map = self.scale(attention_map)
 
             pure_area[attention_map>pure_area] = attention_map[attention_map>pure_area]
 
-        #### method1
-        pure_area[pure_area>=self.threshold] = 1
-        pure_area[pure_area<self.threshold] = 0
-        #### method2
-        # pure_area = threshold_percent_area(pure_area,threshold_percent=self.threshold_percent)
-
-        return pure_area.unsqueeze(1).cuda()
+        #### Divide the attention mask according to the given threshold. For CIFAR10, We use this method
+        if not self.is_imagenet:
+            pure_area[pure_area>=self.threshold] = 1
+            pure_area[pure_area<self.threshold] = 0
+        #### Divide the attention mask according to the given threshold. For ImageNet, We use this method
+        else:
+            pure_area = threshold_percent_area(pure_area,threshold_percent=self.threshold_percent)
+        return pure_area.unsqueeze(1).to(self.device)
 
 
 
@@ -199,7 +225,9 @@ class PurificationForward(torch.nn.Module):
     def denoise(self, x):
 
         mask = self.get_mask(x)
+        Image.fromarray((mask[0][0].cpu().numpy()*255).astype(np.uint8)).save('./mask.png')
         time_steps_b = self.strength_b * self.num_train_timesteps
+        ##### Reference https://blog.csdn.net/LittleNyima/article/details/139661712
         n = x.shape[0]
         x_t = self.diffuse_t_steps(x,self.timesteps[0])
         for t, tau in list(zip(self.timesteps[:-1], self.timesteps[1:])):
@@ -215,6 +243,8 @@ class PurificationForward(torch.nn.Module):
                 x_t = x_t * mask + x_t_ori * (1.- mask)
                 x_t,t = self.diffuse_one_step_from_now(x_t,t,steps=self.forward_noise_steps)
                 
+
+            ## DDIM Sampling
             pred_noise = self.diffusion(x_t,(torch.ones(n)*t).to(self.device))
             if self.is_imagenet:
                 pred_noise, _ = torch.split(pred_noise, 3, dim=1)
@@ -259,7 +289,6 @@ class PurificationForward(torch.nn.Module):
         
         x_clf = diff2clf(x_diff)
         logits = self.clf(x_clf)
-        # return logits
         return logits
 
     def get_img_logits(self, x):
@@ -280,4 +309,3 @@ class PurificationForward(torch.nn.Module):
         logits = self.clf(x_clf)
         # return logits
         return x_clf,logits
-

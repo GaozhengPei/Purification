@@ -1,0 +1,2 @@
+#!/bin/bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 ddp_test.py --dataset cifar10 --batch_size 32 --strength_l 0.2 --strength_s 0.1 --threshold 0.9 --classifier_name WideResNet28-10 --attack_ddim_steps 10 --defense_ddim_steps 500 --forward_noise_steps 3 --attack_method pgd  --n_iter 200 --eot 20 --num_ensemble_runs 20
