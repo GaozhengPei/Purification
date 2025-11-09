@@ -115,7 +115,7 @@ def test(rank, world_size, args):
             clf=clf, diffusion=diffusion,strength_a=args.strength_l,strength_b=args.strength_s, classifier_name=args.classifier_name ,
             is_imagenet=is_imagenet,threshold=args.threshold,threshold_percent=args.threshold_percent,ddim_steps=args.attack_ddim_steps,forward_noise_steps = args.forward_noise_steps,device=device)
         defense_forward = PurificationForward(
-            clf=clf, diffusion=diffusion,strength_a=args.strength_s,strength_b=args.strength_s,  classifier_name=args.classifier_name ,
+            clf=clf, diffusion=diffusion,strength_a=args.strength_l,strength_b=args.strength_s,  classifier_name=args.classifier_name ,
             is_imagenet=is_imagenet,threshold=args.threshold,threshold_percent=args.threshold_percent,ddim_steps=args.defense_ddim_steps,forward_noise_steps = args.forward_noise_steps, device=device)
 
         # Set adversarial attack
